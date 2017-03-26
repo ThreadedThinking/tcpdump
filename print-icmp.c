@@ -86,8 +86,8 @@ struct icmp {
 #define	icmp_data	icmp_dun.id_data
 };
 
-#define ICMP_MPLS_EXT_EXTRACT_VERSION(x) (((x)&0xf0)>>4)
-#define ICMP_MPLS_EXT_VERSION 2
+#define ICMP_EXT_EXTRACT_VERSION(x) (((x)&0xf0)>>4)
+#define ICMP_EXT_VERSION 2
 
 /*
  * Lower bounds on packet lengths for various types.
@@ -143,6 +143,7 @@ struct icmp {
 #define	ICMP_IREQREPLY		16		/* information reply */
 #define	ICMP_MASKREQ		17		/* address mask request */
 #define	ICMP_MASKREPLY		18		/* address mask reply */
+#define	ICMP_UNREACH_CAPPORT	253		/* Behind Captive Portal, temp # */
 
 #define	ICMP_MAXTYPE		18
 
@@ -150,7 +151,7 @@ struct icmp {
 	((type) == ICMP_UNREACH || (type) == ICMP_SOURCEQUENCH || \
 	(type) == ICMP_REDIRECT || (type) == ICMP_TIMXCEED || \
 	(type) == ICMP_PARAMPROB)
-#define	ICMP_MPLS_EXT_TYPE(type) \
+#define	ICMP_EXT_TYPE(type) \
 	((type) == ICMP_UNREACH || \
          (type) == ICMP_TIMXCEED || \
          (type) == ICMP_PARAMPROB)
@@ -187,6 +188,11 @@ struct icmp {
 #ifndef ICMP_UNREACH_PRECEDENCE_CUTOFF
 #define ICMP_UNREACH_PRECEDENCE_CUTOFF	15	/* precedence cutoff */
 #endif
+
+/* CAPPORT draft-wkumari-capport-icmp-unreach  */
+#define ICMP_CAPPORT_V		0x8000
+#define ICMP_CAPPORT_D		0x4000
+#define ICMP_CAPPORT_P		0x2000
 
 /* Most of the icmp types */
 static const struct tok icmp2str[] = {
@@ -256,6 +262,12 @@ struct id_rdiscovery {
 	uint32_t ird_pref;
 };
 
+struct capport_header {
+	uint8_t flags;
+	uint8_t length;
+	uint16_t session_id;
+};
+
 /*
  * draft-bonica-internet-icmp-08
  *
@@ -295,16 +307,18 @@ struct icmp_ext_t {
     uint8_t icmp_ext_data[1];
 };
 
-struct icmp_mpls_ext_object_header_t {
+struct icmp_ext_object_header_t {
     uint8_t length[2];
     uint8_t class_num;
     uint8_t ctype;
 };
 
-static const struct tok icmp_mpls_ext_obj_values[] = {
+
+static const struct tok icmp_ext_obj_values[] = {
     { 1, "MPLS Stack Entry" },
     { 2, "Extended Payload" },
-    { 0, NULL}
+    { 3, "Captive Portal" },
+    { 0, NULL }
 };
 
 /* prototypes */
@@ -340,10 +354,14 @@ icmp_print(netdissect_options *ndo, const u_char *bp, u_int plen, const u_char *
         const uint8_t *obj_tptr;
         uint32_t raw_label;
         const u_char *snapend_save;
-	const struct icmp_mpls_ext_object_header_t *icmp_mpls_ext_object_header;
+	const struct icmp_ext_object_header_t *icmp_ext_object_header;
 	u_int hlen, dport, mtu, obj_tlen, obj_class_num, obj_ctype;
 	char buf[MAXHOSTNAMELEN + 100];
 	struct cksum_vec vec[1];
+	/* captive portal header */
+    uint32_t cp_validity = 0;
+    uint32_t cp_delay = 0;
+    uint32_t cp_policy_class = 0;
 
 	dp = (const struct icmp *)bp;
         ext_dp = (const struct icmp_ext_t *)bp;
@@ -423,7 +441,6 @@ icmp_print(netdissect_options *ndo, const u_char *bp, u_int plen, const u_char *
 			}
 		    }
 			break;
-
 		default:
 			fmt = tok2str(unreach2str, "#%d %%s unreachable",
 			    dp->icmp_code);
@@ -550,7 +567,44 @@ icmp_print(netdissect_options *ndo, const u_char *bp, u_int plen, const u_char *
                 (void)snprintf(buf+strlen(buf),sizeof(buf)-strlen(buf),", xmit %s",
                          icmp_tstamp_print(EXTRACT_32BITS(&dp->icmp_ttime)));
                 break;
+	case ICMP_UNREACH_CAPPORT:
+			{
+			register const struct capport_header *cphead;
+			cphead = (const struct capport_header *)(const u_char *)&dp->icmp_void;
 
+
+			(void)snprintf(buf, sizeof(buf),
+				    "%s unreachable - behind captive portal, Session-ID %u",
+				    ipaddr_string(ndo, &dp->icmp_ip.ip_dst), EXTRACT_16BITS(&cphead->session_id));
+
+
+
+			obj_tptr = (const uint8_t *)dp->icmp_data;
+			obj_tptr += 4*cphead->length;
+			uint16_t cpflags = EXTRACT_16BITS(&cphead->flags);
+			if(cpflags & ICMP_CAPPORT_V) {
+            	cp_validity = EXTRACT_32BITS(obj_tptr);
+            	obj_tptr += 4;
+            	(void)snprintf(buf+strlen(buf), sizeof(buf)-strlen(buf),
+				    ", Validity %u",
+				   cp_validity);
+            }
+            if(cpflags & ICMP_CAPPORT_D) {
+            	cp_delay = EXTRACT_32BITS(obj_tptr);
+            	obj_tptr += 4;
+            	(void)snprintf(buf+strlen(buf), sizeof(buf)-strlen(buf),
+				    ", Delay %u",
+				   cp_delay);
+            }
+            if(cpflags & ICMP_CAPPORT_P) {
+            	cp_policy_class = EXTRACT_32BITS(obj_tptr);
+            	obj_tptr += 4;
+            	(void)snprintf(buf+strlen(buf), sizeof(buf)-strlen(buf),
+				    ", Policy Class %u",
+				   cp_policy_class);
+            }
+        	}
+			break;
 	default:
 		str = tok2str(icmp2str, "type-#%d", dp->icmp_type);
 		break;
@@ -587,9 +641,9 @@ icmp_print(netdissect_options *ndo, const u_char *bp, u_int plen, const u_char *
 	}
 
         /*
-         * Attempt to decode the MPLS extensions only for some ICMP types.
+         * Attempt to decode the extensions only for some ICMP types.
          */
-        if (ndo->ndo_vflag >= 1 && plen > ICMP_EXTD_MINLEN && ICMP_MPLS_EXT_TYPE(dp->icmp_type)) {
+        if (ndo->ndo_vflag >= 1 && plen > ICMP_EXTD_MINLEN && ICMP_EXT_TYPE(dp->icmp_type)) {
 
             ND_TCHECK(*ext_dp);
 
@@ -607,14 +661,14 @@ icmp_print(netdissect_options *ndo, const u_char *bp, u_int plen, const u_char *
                 }
             }
 
-            ND_PRINT((ndo, "\n\tMPLS extension v%u",
-                   ICMP_MPLS_EXT_EXTRACT_VERSION(*(ext_dp->icmp_ext_version_res))));
+            ND_PRINT((ndo, "\n\tICMP extension v%u",
+                   ICMP_EXT_EXTRACT_VERSION(*(ext_dp->icmp_ext_version_res))));
 
             /*
              * Sanity checking of the header.
              */
-            if (ICMP_MPLS_EXT_EXTRACT_VERSION(*(ext_dp->icmp_ext_version_res)) !=
-                ICMP_MPLS_EXT_VERSION) {
+            if (ICMP_EXT_EXTRACT_VERSION(*(ext_dp->icmp_ext_version_res)) !=
+                ICMP_EXT_VERSION) {
                 ND_PRINT((ndo, " packet not supported"));
                 return;
             }
@@ -630,29 +684,29 @@ icmp_print(netdissect_options *ndo, const u_char *bp, u_int plen, const u_char *
             hlen -= 4; /* subtract common header size */
             obj_tptr = (const uint8_t *)ext_dp->icmp_ext_data;
 
-            while (hlen > sizeof(struct icmp_mpls_ext_object_header_t)) {
+            while (hlen > sizeof(struct icmp_ext_object_header_t)) {
 
-                icmp_mpls_ext_object_header = (const struct icmp_mpls_ext_object_header_t *)obj_tptr;
-                ND_TCHECK(*icmp_mpls_ext_object_header);
-                obj_tlen = EXTRACT_16BITS(icmp_mpls_ext_object_header->length);
-                obj_class_num = icmp_mpls_ext_object_header->class_num;
-                obj_ctype = icmp_mpls_ext_object_header->ctype;
-                obj_tptr += sizeof(struct icmp_mpls_ext_object_header_t);
+                icmp_ext_object_header = (const struct icmp_ext_object_header_t *)obj_tptr;
+                ND_TCHECK(*icmp_ext_object_header);
+                obj_tlen = EXTRACT_16BITS(icmp_ext_object_header->length);
+                obj_class_num = icmp_ext_object_header->class_num;
+                obj_ctype = icmp_ext_object_header->ctype;
+                obj_tptr += sizeof(struct icmp_ext_object_header_t);
 
                 ND_PRINT((ndo, "\n\t  %s Object (%u), Class-Type: %u, length %u",
-                       tok2str(icmp_mpls_ext_obj_values,"unknown",obj_class_num),
+                       tok2str(icmp_ext_obj_values,"unknown",obj_class_num),
                        obj_class_num,
                        obj_ctype,
                        obj_tlen));
 
-                hlen-=sizeof(struct icmp_mpls_ext_object_header_t); /* length field includes tlv header */
+                hlen-=sizeof(struct icmp_ext_object_header_t); /* length field includes tlv header */
 
                 /* infinite loop protection */
                 if ((obj_class_num == 0) ||
-                    (obj_tlen < sizeof(struct icmp_mpls_ext_object_header_t))) {
+                    (obj_tlen < sizeof(struct icmp_ext_object_header_t))) {
                     return;
                 }
-                obj_tlen-=sizeof(struct icmp_mpls_ext_object_header_t);
+                obj_tlen-=sizeof(struct icmp_ext_object_header_t);
 
                 switch (obj_class_num) {
                 case 1:
@@ -670,6 +724,33 @@ icmp_print(netdissect_options *ndo, const u_char *bp, u_int plen, const u_char *
                     }
                     break;
 
+                /* Captive Portal Class */
+                case 3:
+                	ND_TCHECK2(*obj_tptr, 4);
+
+                    uint16_t cp_flags = EXTRACT_16BITS(obj_tptr);
+                    obj_tptr += 2;
+                    uint16_t cp_session_id = EXTRACT_16BITS(obj_tptr);
+                    obj_tptr += 2;
+                    ND_PRINT((ndo, "\n\t    Session-ID %u", cp_session_id));
+
+
+                    if(cp_flags & ICMP_CAPPORT_V) {
+                    	cp_validity = EXTRACT_32BITS(obj_tptr);
+                    	obj_tptr += 4;
+                    	ND_PRINT((ndo, ", Validity %u", cp_validity));
+                    }
+                    if(cp_flags & ICMP_CAPPORT_D) {
+                    	cp_delay = EXTRACT_32BITS(obj_tptr);
+                    	obj_tptr += 4;
+                    	ND_PRINT((ndo, ", Delay %u", cp_delay));
+                    }
+                    if(cp_flags & ICMP_CAPPORT_P) {
+                    	cp_policy_class = EXTRACT_32BITS(obj_tptr);
+                    	obj_tptr += 4;
+                    	ND_PRINT((ndo, ", Policy Class %u", cp_policy_class));
+                    }
+                	break;
                /*
                 *  FIXME those are the defined objects that lack a decoder
                 *  you are welcome to contribute code ;-)
